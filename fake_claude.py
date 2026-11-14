@@ -21,6 +21,7 @@ with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as f:
     f.write(json.dumps({"argv": sys.argv[1:], "stdin": prompt, "cwd": os.getcwd(),
                         "base_url": os.environ.get("ANTHROPIC_BASE_URL"),
                         "oauth": "CLAUDE_CODE_OAUTH_TOKEN" in os.environ,
+                        "own": [k for k in ("RUNNER_TOKEN", "LITELLM_KEY") if k in os.environ],
                         "haiku": os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")}) + "\n")
 
 if "slow" in prompt:

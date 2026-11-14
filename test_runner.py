@@ -47,13 +47,14 @@ assert body["session_id"] and body["usage"]["output_tokens"] == 41 and body["tot
 seen = last_call()
 argv = seen["argv"]
 assert argv[:3] == ["-p", "--output-format", "json"], argv
+assert "Bash" in argv[argv.index("--disallowedTools") + 1].split(","), argv
 assert argv[argv.index("--model") + 1] == "claude-haiku-4-5"
 assert argv[argv.index("--append-system-prompt") + 1] == "Antworte kurz."
 assert argv[argv.index("--allowedTools") + 1] == "WebSearch,mcp__memory"
 assert json.loads(argv[argv.index("--mcp-config") + 1]) == {
     "mcpServers": {"memory": {"type": "http", "url": "http://m/mcp"}}}
 assert argv[argv.index("--resume") + 1] == "abc" and seen["stdin"] == "Wie warm ist es?"
-assert seen["oauth"] and seen["base_url"] is None, seen
+assert seen["oauth"] and seen["base_url"] is None and seen["own"] == [], seen
 assert Path(seen["cwd"]).resolve() == (tmp / "work").resolve(), (seen["cwd"], tmp)
 
 # --- copilot first: mapped model, LiteLLM instead of Anthropic, no made-up cost
@@ -61,7 +62,7 @@ r = run(prompt="x", model="claude-opus-5-5", route=["copilot", "anthropic"])
 body, seen = r.json(), last_call()
 assert body["route"] == "copilot" and body["model"] == "copilot-claude-opus", body
 assert body["total_cost_usd"] is None and body["failed_routes"] == []
-assert seen["base_url"] == "http://litellm:4000" and not seen["oauth"]
+assert seen["base_url"] == "http://litellm:4000" and not seen["oauth"] and seen["own"] == []
 assert seen["haiku"] == "copilot-claude-haiku"
 
 # --- copilot fails: Anthropic answers, the copilot error is reported along
@@ -89,7 +90,14 @@ assert detail["failed_routes"][0]["route"] == "anthropic", detail
 r = run(prompt="slow", timeout=2)
 assert r.status_code == 503 and "timeout after 2 s" in r.json()["detail"]["error"], r.text
 
+# --- the wait for a free slot counts against the timeout
+real_slots, main.slots = main.slots, main.asyncio.Semaphore(0)
+r = run(prompt="x", timeout=1)
+assert r.status_code == 503 and "waiting for a free slot" in r.json()["detail"]["error"], r.text
+main.slots = real_slots
+
 # --- input checks
+assert run(prompt="x", allowed_tools=["WebSearch", "Bash(cat:*)"]).status_code == 400
 assert api.post("/v1/run", json={"prompt": "x"}).status_code == 401
 assert run(prompt="x", route=["openai"]).status_code == 400
 assert run(prompt="").status_code == 422

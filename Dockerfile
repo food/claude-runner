@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
     && npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
     && rm -rf /var/lib/apt/lists/* /root/.npm
 
-RUN useradd -m runner
+RUN useradd -m runner && mkdir /home/runner/work && chown runner /home/runner/work
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

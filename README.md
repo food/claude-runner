@@ -21,11 +21,11 @@ Authorization: Bearer <RUNNER_TOKEN>
 | `prompt` | Sent on stdin. |
 | `system` | `--append-system-prompt`, added to Claude Code's own. |
 | `model` | `--model`. |
-| `allowed_tools` | `--allowedTools`; without it the CLI may use only its permission-free tools. |
+| `allowed_tools` | `--allowedTools`. Tools that reach into the container (Bash, Read, Write, Edit, Glob, Grep, notebooks) are always disallowed and refused with 400: the container holds the login token. |
 | `mcp_servers` | Passed as `--mcp-config`. |
 | `resume` | `session_id` of an earlier run to continue it. |
 | `route` | Tried in order: `anthropic` (the login) and `copilot` (LiteLLM, only for models in `COPILOT_MODELS`). Default `RUNNER_ROUTE`. |
-| `timeout` | Seconds per route, up to 3600. |
+| `timeout` | Seconds per route, up to 3600, including the wait for a free slot. A caller that hangs up stops the run. |
 
 The answer is the CLI's own JSON (`result`, `session_id`, `usage`,
 `total_cost_usd`, ...) plus `route`, the `model` actually asked, `seconds` and
@@ -44,7 +44,7 @@ cp .env.example .env   # token from `claude setup-token`, RUNNER_TOKEN, LiteLLM
 docker compose up -d --build
 ```
 
-`./home` keeps the CLI's sessions, so `resume` survives a rebuild.
+The volume `home` keeps the CLI's sessions, so `resume` survives a rebuild.
 
 ## Test
 
