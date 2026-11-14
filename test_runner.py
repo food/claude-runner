@@ -68,22 +68,26 @@ assert seen["haiku"] == "copilot-claude-haiku"
 r = run(prompt="copilot-down", model="claude-opus-5-5", route=["copilot", "anthropic"])
 body = r.json()
 assert body["route"] == "anthropic" and body["model"] == "claude-opus-5-5", body
-assert "OAuth session expired" in body["failed_routes"][0], body
+failed = body["failed_routes"][0]
+assert failed["route"] == "copilot" and failed["model"] == "copilot-claude-opus", failed
+assert "OAuth session expired" in failed["error"] and not failed["skipped"], failed
 
 # --- copilot does not apply: model without mapping, or before COPILOT_FROM
 r = run(prompt="x", model="claude-sonnet-5", route=["copilot", "anthropic"])
-assert r.json()["route"] == "anthropic" and "not available" in r.json()["failed_routes"][0]
+assert r.json()["route"] == "anthropic" and r.json()["failed_routes"][0]["skipped"]
 main.COPILOT_FROM = "2999-01-01"
 assert run(prompt="x", model="claude-opus-5-5", route=["copilot", "anthropic"]).json()["route"] == "anthropic"
 main.COPILOT_FROM = ""
 
 # --- every route fails: 503 with the CLI's own message
 r = run(prompt="expired")
-assert r.status_code == 503 and "OAuth session expired" in r.json()["detail"], r.text
+detail = r.json()["detail"]
+assert r.status_code == 503 and "OAuth session expired" in detail["error"], r.text
+assert detail["failed_routes"][0]["route"] == "anthropic", detail
 
 # --- a hanging CLI is killed after the timeout
 r = run(prompt="slow", timeout=2)
-assert r.status_code == 503 and "timeout after 2 s" in r.json()["detail"], r.text
+assert r.status_code == 503 and "timeout after 2 s" in r.json()["detail"]["error"], r.text
 
 # --- input checks
 assert api.post("/v1/run", json={"prompt": "x"}).status_code == 401

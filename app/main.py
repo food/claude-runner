@@ -100,14 +100,16 @@ async def execute(cmd: list[str], env: dict, prompt: str, timeout: float) -> dic
 
 @app.post("/v1/run")
 async def run_claude(run: Run, authorization: str | None = Header(None)):
-    """Run the prompt on the first route that answers; 503 with every route's error otherwise."""
+    """Run the prompt on the first route that answers; 503 with every route's failure otherwise.
+    Each failure is {route, model, error, seconds, skipped}, so callers can log the attempts."""
     if RUNNER_TOKEN and authorization != f"Bearer {RUNNER_TOKEN}":
         raise HTTPException(401, "bearer token required")
-    errors = []
+    failed = []
     for name in run.route or ROUTE:
         setup = route_setup(name, run.model)
         if setup is None:
-            errors.append(f"{name}: not available for model {run.model}")
+            failed.append({"route": name, "model": run.model, "error": "not available for this model",
+                           "seconds": 0, "skipped": True})
             continue
         model, env = setup
         start = time.monotonic()
@@ -115,14 +117,18 @@ async def run_claude(run: Run, authorization: str | None = Header(None)):
             async with slots:
                 data = await execute(command(run, model), env, run.prompt, run.timeout)
         except Exception as e:
-            errors.append(f"{name}: {e}")
-            log.warning("run %s %s failed after %.0f s: %s", name, model, time.monotonic() - start, e)
+            seconds = round(time.monotonic() - start, 1)
+            failed.append({"route": name, "model": model, "error": str(e), "seconds": seconds,
+                           "skipped": False})
+            log.warning("run %s %s failed after %.0f s: %s", name, model, seconds, e)
             continue
         if name == "copilot":
             data["total_cost_usd"] = None  # the CLI prices with Anthropic's list, not the subscription
-        log.info("run %s %s %.0f s", name, model, time.monotonic() - start)
-        return {**data, "route": name, "model": model, "failed_routes": errors}
-    raise HTTPException(503, "; ".join(errors))
+        seconds = round(time.monotonic() - start, 1)
+        log.info("run %s %s %.0f s", name, model, seconds)
+        return {**data, "route": name, "model": model, "seconds": seconds, "failed_routes": failed}
+    raise HTTPException(503, {"error": "; ".join(f"{f['route']}: {f['error']}" for f in failed),
+                              "failed_routes": failed})
 
 
 _version = None

@@ -28,11 +28,12 @@ Authorization: Bearer <RUNNER_TOKEN>
 | `timeout` | Seconds per route, up to 3600. |
 
 The answer is the CLI's own JSON (`result`, `session_id`, `usage`,
-`total_cost_usd`, ...) plus `route`, the `model` actually asked and
-`failed_routes`. On the copilot route `total_cost_usd` is null: the CLI prices
+`total_cost_usd`, ...) plus `route`, the `model` actually asked, `seconds` and
+`failed_routes` (each `{route, model, error, seconds, skipped}`; `skipped`
+means the route does not serve that model). On the copilot route `total_cost_usd` is null: the CLI prices
 with Anthropic's list, which says nothing about a Copilot subscription. A
 route counts as failed on a non-zero exit, `is_error`, an empty result or the
-timeout; if all fail the answer is 503 with each route's error.
+timeout; if all fail the answer is 503 with `detail: {error, failed_routes}`.
 
 At most `RUNNER_MAX_RUNS` CLI processes run at once, the rest wait.
 
