@@ -1,0 +1,17 @@
+services:
+  claude-runner:
+    build: .
+    container_name: claude-runner
+    ports:
+      - "8769:8000"
+    env_file: .env
+    environment:
+      - TZ=Europe/Berlin
+    # Named volume, not a bind mount: docker would create ./home as root and the
+    # runner user could not write its sessions.
+    volumes:
+      - home:/home/runner
+    restart: unless-stopped
+
+volumes:
+  home:

@@ -1,0 +1,170 @@
+"""claude-runner: headless Claude Code CLI runs behind one HTTP endpoint."""
+import asyncio
+import json
+import logging
+import os
+import time
+from datetime import date
+
+from fastapi import FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel, Field
+
+# A command line, so tests can put a fake CLI behind the interpreter.
+CLAUDE = os.environ.get("CLAUDE_BIN", "claude").split()
+RUNNER_TOKEN = os.environ.get("RUNNER_TOKEN", "")
+# Sessions for --resume are stored per working directory, so it has to stay the same.
+WORKDIR = os.environ.get("RUNNER_WORKDIR", os.path.expanduser("~/work"))
+ROUTE = os.environ.get("RUNNER_ROUTE", "anthropic").split(",")
+MAX_RUNS = int(os.environ.get("RUNNER_MAX_RUNS", "3"))
+# Copilot route: the CLI talks to LiteLLM's Anthropic endpoint instead of Anthropic.
+LITELLM_URL = os.environ.get("LITELLM_URL", "")
+LITELLM_KEY = os.environ.get("LITELLM_KEY", "")
+COPILOT_MODELS = dict(pair.strip().split("=", 1)
+                      for pair in os.environ.get("COPILOT_MODELS", "").split(",") if "=" in pair)
+# ISO date before which the copilot route is skipped, e.g. when the monthly quota is used up.
+COPILOT_FROM = os.environ.get("COPILOT_FROM", "")
+# Tools that reach into the container; with them a prompt could read the login token
+# from the environment. Always disallowed, and a request asking for them is refused.
+LOCAL_TOOLS = ["Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep",
+               "NotebookEdit", "NotebookRead"]
+# The runner's own settings, never handed to the CLI.
+OWN_SETTINGS = ("RUNNER_TOKEN", "LITELLM_KEY")
+
+log = logging.getLogger("uvicorn.error")
+app = FastAPI()
+slots = asyncio.Semaphore(MAX_RUNS)
+os.makedirs(WORKDIR, exist_ok=True)
+
+
+class Run(BaseModel):
+    prompt: str = Field(min_length=1)
+    system: str | None = None  # appended to Claude Code's own system prompt
+    model: str | None = None
+    allowed_tools: list[str] = []
+    mcp_servers: dict | None = None
+    resume: str | None = None  # session_id of an earlier run
+    route: list[str] | None = None  # tried in order; default RUNNER_ROUTE
+    timeout: float = Field(300, gt=0, le=3600)  # per route, including the wait for a free slot
+
+
+def command(run: Run, model: str | None) -> list[str]:
+    """CLI arguments for one run; the prompt goes in on stdin."""
+    cmd = [*CLAUDE, "-p", "--output-format", "json", "--disallowedTools", ",".join(LOCAL_TOOLS)]
+    if model:
+        cmd += ["--model", model]
+    if run.system:
+        cmd += ["--append-system-prompt", run.system]
+    if run.allowed_tools:
+        cmd += ["--allowedTools", ",".join(run.allowed_tools)]
+    if run.mcp_servers:
+        cmd += ["--mcp-config", json.dumps({"mcpServers": run.mcp_servers})]
+    if run.resume:
+        cmd += ["--resume", run.resume]
+    return cmd
+
+
+def route_setup(name: str, model: str | None) -> tuple[str | None, dict] | None:
+    """Model and environment for one route, or None if the route does not apply."""
+    env = {k: v for k, v in os.environ.items() if k not in OWN_SETTINGS}
+    if name == "anthropic":
+        return model, env
+    if name == "copilot":
+        if not LITELLM_URL or model not in COPILOT_MODELS or date.today().isoformat() < COPILOT_FROM:
+            return None
+        for key in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+            env.pop(key, None)
+        env.update(ANTHROPIC_BASE_URL=LITELLM_URL, ANTHROPIC_AUTH_TOKEN=LITELLM_KEY or "-",
+                   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+        # The CLI does small side tasks with Haiku; those must not go to Anthropic either.
+        if "claude-haiku-4-5" in COPILOT_MODELS:
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = COPILOT_MODELS["claude-haiku-4-5"]
+        return COPILOT_MODELS[model], env
+    raise HTTPException(400, f"unknown route {name!r}, use anthropic or copilot")
+
+
+async def execute(cmd: list[str], env: dict, prompt: str, timeout: float, request: Request) -> dict:
+    """One CLI run. Exit code, is_error and an empty result all count as failure;
+    the CLI writes errors like "OAuth session expired" to stdout, so both streams go into the message.
+    A caller that hangs up stops the run, so it does not spend quota for nobody."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=WORKDIR, env=env, stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    talk = asyncio.ensure_future(proc.communicate(prompt.encode()))
+    deadline = time.monotonic() + timeout
+    while not talk.done():
+        await asyncio.wait({talk}, timeout=1)
+        if talk.done():
+            break
+        gone = await request.is_disconnected()
+        if gone or time.monotonic() > deadline:
+            proc.kill()
+            await talk
+            raise RuntimeError("caller hung up" if gone else f"timeout after {timeout:.0f} s")
+    out, err = talk.result()
+    try:
+        data = json.loads(out)
+    except ValueError:
+        data = None
+    if proc.returncode or not isinstance(data, dict) or data.get("is_error") \
+            or not str(data.get("result") or "").strip():
+        tail = (err + out).decode(errors="replace").strip()[-500:]
+        raise RuntimeError(f"exit {proc.returncode}: {tail}")
+    return data
+
+
+@app.post("/v1/run")
+async def run_claude(run: Run, request: Request, authorization: str | None = Header(None)):
+    """Run the prompt on the first route that answers; 503 with every route's failure otherwise.
+    Each failure is {route, model, error, seconds, skipped}, so callers can log the attempts."""
+    if RUNNER_TOKEN and authorization != f"Bearer {RUNNER_TOKEN}":
+        raise HTTPException(401, "bearer token required")
+    blocked = [t for t in run.allowed_tools if t.split("(")[0] in LOCAL_TOOLS]
+    if blocked:
+        raise HTTPException(400, f"tools {blocked} are not allowed here")
+    failed = []
+    for name in run.route or ROUTE:
+        setup = route_setup(name, run.model)
+        if setup is None:
+            failed.append({"route": name, "model": run.model, "error": "not available for this model",
+                           "seconds": 0, "skipped": True})
+            continue
+        model, env = setup
+        start = time.monotonic()
+        try:
+            # The wait for a free slot counts against the timeout, so callers can size theirs.
+            try:
+                await asyncio.wait_for(slots.acquire(), run.timeout)
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"timeout after {run.timeout:.0f} s waiting for a free slot") from None
+            try:
+                data = await execute(command(run, model), env, run.prompt,
+                                     run.timeout - (time.monotonic() - start), request)
+            finally:
+                slots.release()
+        except Exception as e:
+            seconds = round(time.monotonic() - start, 1)
+            failed.append({"route": name, "model": model, "error": str(e), "seconds": seconds,
+                           "skipped": False})
+            log.warning("run %s %s failed after %.0f s: %s", name, model, seconds, e)
+            continue
+        if name == "copilot":
+            data["total_cost_usd"] = None  # the CLI prices with Anthropic's list, not the subscription
+        seconds = round(time.monotonic() - start, 1)
+        log.info("run %s %s %.0f s", name, model, seconds)
+        return {**data, "route": name, "model": model, "seconds": seconds, "failed_routes": failed}
+    raise HTTPException(503, {"error": "; ".join(f"{f['route']}: {f['error']}" for f in failed),
+                              "failed_routes": failed})
+
+
+_version = None
+
+
+@app.get("/health")
+async def health():
+    """Liveness and the installed CLI version."""
+    global _version
+    if _version is None:
+        proc = await asyncio.create_subprocess_exec(*CLAUDE, "--version",
+                                                    stdout=asyncio.subprocess.PIPE)
+        _version = (await proc.communicate())[0].decode().strip()
+    return {"ok": True, "cli": _version, "route": ROUTE}
